@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,12 +7,8 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import faiss
-from dotenv import load_dotenv
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-
-load_dotenv()
 
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -34,9 +29,6 @@ class QueryResult:
 
 
 class PDFIngestor:
-    def __init__(self) -> None:
-        pass
-
     def read_pdf_pages(self, pdf_path: Path) -> List[Tuple[int, str]]:
         reader = PdfReader(str(pdf_path))
         pages: List[Tuple[int, str]] = []
@@ -59,7 +51,6 @@ class Chunker:
 
     @staticmethod
     def _approx_tokens(text: str) -> int:
-        # crude approximation: 1 token ~ 4 chars (English-ish)
         return max(1, math.ceil(len(text) / 4))
 
     def chunk_page(self, document: str, page: int, text: str) -> List[Chunk]:
@@ -67,7 +58,6 @@ class Chunker:
         if not words:
             return []
 
-        # approximate tokens per word ~ 1.3, so words/window ~ tokens/1.3
         words_per_chunk = max(50, int(self.chunk_tokens / 1.3))
         words_overlap = max(0, int(self.overlap_tokens / 1.3))
         stride = max(1, words_per_chunk - words_overlap)
@@ -96,8 +86,7 @@ class Embedder:
 
 class FaissStore:
     def __init__(self, dim: int) -> None:
-        # cosine similarity via inner product when vectors are normalized
-        self.index = faiss.IndexFlatIP(dim)
+        self.index = faiss.IndexFlatIP(dim)  # cosine via IP on normalized vectors
         self.chunks: List[Chunk] = []
 
     def add(self, chunks: List[Chunk], embeddings: np.ndarray) -> None:
@@ -115,6 +104,14 @@ class FaissStore:
 
 
 class RAGPipeline:
+    """
+    Fully-local RAG pipeline:
+    - local PDF parsing
+    - local embeddings (sentence-transformers)
+    - local FAISS search
+    - local "answer": retrieval-only summary with citations (no LLM call)
+    """
+
     def __init__(
         self,
         pdf_dir: str = "data/sample_pdfs",
@@ -130,16 +127,13 @@ class RAGPipeline:
         self.chunker = Chunker()
         self.embedder = Embedder(embed_model)
 
-        self._openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self._openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
         self.store: Optional[FaissStore] = None
 
     def build_index(self) -> None:
         pdf_paths = sorted(self.pdf_dir.glob("*.pdf"))
         if not pdf_paths:
             raise FileNotFoundError(
-                f"No PDFs found under {self.pdf_dir}. Add 3 PDFs named nda.pdf, service_agreement.pdf, ip_agreement.pdf."
+                f"No PDFs found under {self.pdf_dir}. Ensure PDFs exist in that folder."
             )
 
         all_chunks: List[Chunk] = []
@@ -153,7 +147,6 @@ class RAGPipeline:
         self.store.add(all_chunks, embeddings)
 
     def _confidence(self, top_score: float) -> float:
-        # cosine similarity already in [-1,1]; clamp to [0,1]
         return float(max(0.0, min(1.0, (top_score + 1) / 2)))
 
     def query(self, question: str) -> QueryResult:
@@ -170,45 +163,20 @@ class RAGPipeline:
                 confidence=0.0,
             )
 
-        # Build context with citations
-        context_blocks = []
-        for ch in chunks[: self.top_k]:
-            context_blocks.append(f"[{ch.document} | page {ch.page}]\n{ch.text}")
+        # Retrieval-only answer: show best-matching snippets + citations.
+        top = chunks[:3]
+        bullets = []
+        for ch in top:
+            snippet = ch.text.strip().replace("\n", " ")
+            snippet = (snippet[:350] + "...") if len(snippet) > 350 else snippet
+            bullets.append(f"- ({ch.document}, page {ch.page}) {snippet}")
 
-        context = "\n\n".join(context_blocks)
-
-        system = (
-            "You are a legal document QA assistant.\n"
-            "Rules:\n"
-            "1) Answer ONLY using the provided context.\n"
-            "2) If the answer is not explicitly present, say you cannot find it.\n"
-            "3) Cite sources by document name and page number.\n"
-            "4) Be concise and factual.\n"
+        answer = (
+            "Local mode (no OpenAI quota required). Top retrieved evidence:\n"
+            + "\n".join(bullets)
+            + "\n\nIf you enable an LLM later, you can generate a natural-language answer from these citations."
         )
 
-        user = (
-            f"Context:\n{context}\n\n"
-            f"Question: {question}\n\n"
-            "Return:\n"
-            "- Answer (1-4 sentences)\n"
-            "- Sources: bullet list with (document, page)\n"
-        )
-
-        resp = self._openai.chat.completions.create(
-            model=self._openai_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            max_tokens=400,
-        )
-        answer = resp.choices[0].message.content.strip()
-
-        sources = [
-            {"document": ch.document, "page": ch.page, "chunk": ch.text}
-            for ch in chunks[:3]
-        ]
+        sources = [{"document": ch.document, "page": ch.page, "chunk": ch.text} for ch in top]
         conf = self._confidence(scores[0])
-
         return QueryResult(answer=answer, sources=sources, confidence=conf)
